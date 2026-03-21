@@ -1,18 +1,23 @@
 import { useEffect, useRef } from "react";
 import * as Cesium from "cesium";
+import { createTrackingLayerManager } from "../modules/tracking/layerManager";
+import {
+  classifyAircraft,
+  filterAircraftByType,
+} from "../modules/aircraft/classifyAircraft";
+import { fetchAircraftLive } from "../modules/aircraft/providers/liveAircraftProvider";
 
-function GlobeView() {
+function GlobeView({ activeModules, aircraftFilters }) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
+  const layerManagerRef = useRef(null);
+  const refreshTimerRef = useRef(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
 
     const googleKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
     const ionToken = import.meta.env.VITE_CESIUM_ION_TOKEN;
-
-    console.log("[Globe] google key exists:", !!googleKey);
-    console.log("[Globe] ion token exists:", !!ionToken);
 
     if (!googleKey || !ionToken) {
       console.error("[Globe] Missing env keys");
@@ -25,8 +30,6 @@ function GlobeView() {
 
     const init = async () => {
       try {
-        console.log("[Globe] creating viewer...");
-
         const viewer = new Cesium.Viewer(containerRef.current, {
           terrain: Cesium.Terrain.fromWorldTerrain(),
           timeline: false,
@@ -50,19 +53,13 @@ function GlobeView() {
         }
 
         viewerRef.current = viewer;
-
         viewer.scene.globe.depthTestAgainstTerrain = true;
-        viewer.scene.debugShowFramesPerSecond = true;
 
-        console.log("[Globe] loading OSM fallback buildings...");
         const osmBuildings = await Cesium.createOsmBuildingsAsync();
-
         if (!destroyed && !viewer.isDestroyed()) {
           viewer.scene.primitives.add(osmBuildings);
-          console.log("[Globe] OSM buildings added");
         }
 
-        console.log("[Globe] loading Google photorealistic 3D tiles...");
         const googleTileset = await Cesium.Cesium3DTileset.fromUrl(
           `https://tile.googleapis.com/v1/3dtiles/root.json?key=${googleKey}`
         );
@@ -73,10 +70,10 @@ function GlobeView() {
 
         if (!destroyed && !viewer.isDestroyed()) {
           viewer.scene.primitives.add(googleTileset);
-          console.log("[Globe] Google 3D tiles added");
         }
 
-        // Start somewhere mountainous + urban
+        layerManagerRef.current = createTrackingLayerManager(viewer);
+
         viewer.camera.flyTo({
           destination: Cesium.Cartesian3.fromDegrees(18.4241, -33.9249, 12000),
           orientation: {
@@ -84,14 +81,12 @@ function GlobeView() {
             pitch: Cesium.Math.toRadians(-45),
             roll: 0,
           },
-          duration: 3,
+          duration: 2.5,
         });
 
         viewer.scene.requestRender();
       } catch (error) {
         console.error("[Globe] init failed:", error);
-        console.error("[Globe] name:", error?.name);
-        console.error("[Globe] message:", error?.message);
       }
     };
 
@@ -99,11 +94,73 @@ function GlobeView() {
 
     return () => {
       destroyed = true;
+
+      if (refreshTimerRef.current) {
+        clearInterval(refreshTimerRef.current);
+      }
+
       if (viewerRef.current && !viewerRef.current.isDestroyed()) {
         viewerRef.current.destroy();
       }
     };
   }, []);
+
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    const layerManager = layerManagerRef.current;
+
+    if (!viewer || !layerManager) return;
+
+    layerManager.setLayerVisibility("aircraft", !!activeModules.aircraft);
+    layerManager.setLayerVisibility("boats", !!activeModules.boats);
+    layerManager.setLayerVisibility("satellites", !!activeModules.satellites);
+
+    const loadAircraft = async () => {
+      if (!activeModules.aircraft) {
+        layerManager.clearLayer("aircraft");
+        viewer.scene.requestRender();
+        return;
+      }
+
+      try {
+        const raw = await fetchAircraftLive();
+
+        const aircraft = raw
+          .map((item) => ({
+            ...item,
+            type: classifyAircraft(item),
+          }))
+          .filter((item) => filterAircraftByType(item, aircraftFilters));
+
+        layerManager.renderAircraft(aircraft);
+        viewer.scene.requestRender();
+      } catch (error) {
+        console.error("[Aircraft] live fetch failed:", error);
+      }
+    };
+
+    loadAircraft();
+
+    if (refreshTimerRef.current) {
+      clearInterval(refreshTimerRef.current);
+    }
+
+    refreshTimerRef.current = setInterval(loadAircraft, 15000);
+
+    if (!activeModules.boats) {
+      layerManager.clearLayer("boats");
+    }
+
+    if (!activeModules.satellites) {
+      layerManager.clearLayer("satellites");
+    }
+
+    return () => {
+      if (refreshTimerRef.current) {
+        clearInterval(refreshTimerRef.current);
+      }
+    };
+  }, [activeModules, aircraftFilters]);
 
   return <div ref={containerRef} className="globe-container" />;
 }
